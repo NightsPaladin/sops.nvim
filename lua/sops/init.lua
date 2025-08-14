@@ -43,18 +43,42 @@ function M.setup(user_config)
     end,
   })
 
+  -- vim.api.nvim_create_autocmd("BufWritePre", {
+  --   pattern = "*",
+  --   callback = function(args)
+  --     -- Only handle files that have SOPS metadata
+  --     if sops_metadata[args.buf] and sops_keys[args.buf] then
+  --       M.encrypt_file(args.buf)
+  --     end
+  --   end,
+  -- })
+
   vim.api.nvim_create_autocmd("BufWriteCmd", {
     pattern = "*",
     callback = function(args)
+      local bufnr = args.buf
       -- Only handle files that have SOPS metadata
-      if sops_metadata[args.buf] and sops_keys[args.buf] then
-        M.encrypt_file(args.buf)
-        -- Prevent Neovim from writing the file again
-        return true
-      end
+      if sops_metadata[bufnr] and sops_keys[bufnr] then
+        local messages = {}
+        -- Temporarily intercept notifications
+        local old_notify = vim.notify
+        vim.notify = function(msg, level, opts)
+          table.insert(messages, { msg, level, opts })
+        end
 
-      -- For non-SOPS files, let Neovim handle the write normally
-      return false
+        M.encrypt_file(args.buf)
+        vim.bo[bufnr].modified = false
+
+        -- Restore notify and send messages *after* write finishes
+        vim.notify = old_notify
+        vim.schedule(function()
+          for _, m in ipairs(messages) do
+            vim.notify(m[1], m[2], m[3])
+          end
+        end)
+      else
+        vim.cmd("write!")
+      end
     end,
   })
 
@@ -407,7 +431,7 @@ function M.decrypt_file(bufnr)
     local keys = extract_sops_keys(metadata)
     sops_keys[bufnr] = keys
 
-    local key_count = #keys.kms + #keys.gcp_kms + #keys.azure_kv + #keys.pgp + #keys.age + #keys.hc_vault_transit_uri
+    -- local key_count = #keys.kms + #keys.gcp_kms + #keys.azure_kv + #keys.pgp + #keys.age + #keys.hc_vault_transit_uri
     -- vim.notify("[sops.nvim] Extracted " .. key_count .. " total keys", vim.log.levels.DEBUG)
   else
     vim.notify("[sops.nvim] No metadata extracted from file", vim.log.levels.WARN)
