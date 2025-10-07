@@ -93,6 +93,7 @@ The plugin provides several user commands for manual control:
 - `:SopsEncrypt` - Manually encrypt the current buffer
 - `:SopsReload` - Reload and decrypt the current SOPS file
 - `:SopsCleanup` - Clean up stored SOPS metadata for the current buffer
+- `:SopsClearAuthCache` - Clear cached authentication check results (useful after re-authenticating to cloud providers)
 
 ### Backend Authentication
 
@@ -149,6 +150,16 @@ The plugin provides informative notifications about its operations. Check `:mess
 3. **Decryption**: File is decrypted using the `sops -d` command with appropriate environment variables
 4. **Editing**: You edit the decrypted content normally in Neovim
 5. **Re-encryption**: On save, the plugin re-encrypts using the original keys and configuration via `sops -e`
+
+### Performance Optimizations
+
+The plugin includes several optimizations for better performance:
+
+- **Authentication Caching**: Authentication checks for cloud providers (AWS, GCP, Azure) and key stores (PGP, Age) are cached for 5 minutes to avoid repeated system calls
+- **Early Exit Optimization**: Backend detection stops scanning once all backends are identified
+- **Efficient Pattern Matching**: Multiple pattern checks are optimized to skip already-detected backends
+- **Code Deduplication**: Vault address parsing logic is extracted into a reusable helper function
+- **Smart Metadata Scanning**: SOPS metadata is checked at the end of files first (where it's typically located) before scanning the beginning
 
 ## Security Considerations
 

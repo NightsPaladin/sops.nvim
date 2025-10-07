@@ -9,6 +9,16 @@ local config = {
 local sops_metadata = {}
 local sops_keys = {}
 
+-- Cache authentication check results to avoid repeated system calls
+local auth_cache = {
+  aws = { valid = false, timestamp = 0 },
+  gcp = { valid = false, timestamp = 0 },
+  azure = { valid = false, timestamp = 0 },
+  pgp = { valid = false, timestamp = 0 },
+  age = { valid = false, timestamp = 0 },
+}
+local AUTH_CACHE_TTL = 300 -- 5 minutes in seconds
+
 function M.setup(user_config)
   config = vim.tbl_deep_extend("force", config, user_config or {})
 
@@ -26,6 +36,10 @@ function M.setup(user_config)
     local bufnr = vim.api.nvim_get_current_buf()
     M.cleanup_keys(bufnr)
   end, { desc = "Clean up stored SOPS keys for current buffer" })
+
+  vim.api.nvim_create_user_command("SopsClearAuthCache", function()
+    M.clear_auth_cache()
+  end, { desc = "Clear cached authentication check results" })
 
   vim.api.nvim_create_user_command("SopsReload", function()
     local path = vim.api.nvim_buf_get_name(0)
@@ -151,6 +165,11 @@ local function extract_sops_keys(metadata)
     age = {},
     hc_vault_transit_uri = {},
   }
+
+  -- Early return if no metadata
+  if not metadata or #metadata == 0 then
+    return keys
+  end
 
   local in_sops_section = false
   local current_section = nil
@@ -327,69 +346,136 @@ local function get_vault_token(addr)
   return "token-helper-managed"
 end
 
+-- Extract Vault address from SOPS metadata
+local function extract_vault_address_from_metadata(metadata)
+  local in_hc_vault_section = false
+  
+  for _, line in ipairs(metadata) do
+    if line:match("^%s*hc_vault:%s*$") then
+      in_hc_vault_section = true
+    elseif in_hc_vault_section and line:match("^%s") then
+      if line:match("^%s*%-") then
+        local found_addr = line:match("vault_address:%s*['\"]?(https://[%w%p]+)['\"]?")
+        if found_addr then
+          return found_addr
+        end
+      end
+    elseif in_hc_vault_section then
+      break -- Left the hc_vault section
+    end
+  end
+  
+  return nil
+end
+
 local function detect_key_backends(bufnr)
   local keys = { aws = false, gcp = false, azure = false, pgp = false, vault = false, age = false }
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, math.min(300, vim.api.nvim_buf_line_count(bufnr)), false)
   for _, line in ipairs(lines) do
-    if line:match("arn:aws:kms:") then
+    -- Optimize by checking all patterns in one loop iteration
+    if not keys.aws and line:match("arn:aws:kms:") then
       keys.aws = true
     end
-    if line:match("projects/[%w%-]+/locations/[%w%-]+/keyRings") then
+    if not keys.gcp and line:match("projects/[%w%-]+/locations/[%w%-]+/keyRings") then
       keys.gcp = true
     end
-    if line:match("azure:keyvault") or line:match("vault.azure.net") then
+    if not keys.azure and (line:match("azure:keyvault") or line:match("vault.azure.net")) then
       keys.azure = true
     end
-    if line:match("pgp:") or line:match("pgpkeys:") or line:match("PGP PUBLIC KEY BLOCK") then
+    if not keys.pgp and (line:match("pgp:") or line:match("pgpkeys:") or line:match("PGP PUBLIC KEY BLOCK")) then
       keys.pgp = true
     end
-    if line:match("vault:") or line:match("address:") then
+    if not keys.vault and (line:match("vault:") or line:match("address:")) then
       keys.vault = true
     end
-    if line:match("age1[a-z0-9]+") then
+    if not keys.age and line:match("age1[a-z0-9]+") then
       keys.age = true
+    end
+    
+    -- Early exit if all backends are detected
+    if keys.aws and keys.gcp and keys.azure and keys.pgp and keys.vault and keys.age then
+      break
     end
   end
   return keys
 end
 
 local function check_aws_auth()
+  local now = os.time()
+  if auth_cache.aws.timestamp + AUTH_CACHE_TTL > now then
+    return auth_cache.aws.valid
+  end
+  
   local result = vim.system({ "aws", "sts", "get-caller-identity" }):wait()
-  return result.code == 0
+  auth_cache.aws.valid = result.code == 0
+  auth_cache.aws.timestamp = now
+  return auth_cache.aws.valid
 end
 
 local function check_gcp_auth()
+  local now = os.time()
+  if auth_cache.gcp.timestamp + AUTH_CACHE_TTL > now then
+    return auth_cache.gcp.valid
+  end
+  
   local result = vim.system({ "gcloud", "auth", "list", "--filter=status:ACTIVE", "--format=value(account)" }):wait()
+  local valid = false
   if result.code == 0 and result.stdout then
     local lines = vim.split(result.stdout, "\n", { trimempty = true })
-    return #lines > 0
+    valid = #lines > 0
   end
-  return false
+  auth_cache.gcp.valid = valid
+  auth_cache.gcp.timestamp = now
+  return valid
 end
 
 local function check_azure_auth()
+  local now = os.time()
+  if auth_cache.azure.timestamp + AUTH_CACHE_TTL > now then
+    return auth_cache.azure.valid
+  end
+  
   local result = vim.system({ "az", "account", "show" }):wait()
-  return result.code == 0
+  auth_cache.azure.valid = result.code == 0
+  auth_cache.azure.timestamp = now
+  return auth_cache.azure.valid
 end
 
 local function check_pgp_keys()
+  local now = os.time()
+  if auth_cache.pgp.timestamp + AUTH_CACHE_TTL > now then
+    return auth_cache.pgp.valid
+  end
+  
   local result = vim.system({ "gpg", "--list-secret-keys" }):wait()
+  local valid = false
   if result.code == 0 and result.stdout then
     local lines = vim.split(result.stdout, "\n", { trimempty = true })
-    return #lines > 0
+    valid = #lines > 0
   end
-  return false
+  auth_cache.pgp.valid = valid
+  auth_cache.pgp.timestamp = now
+  return valid
 end
 
 local function check_age_keys()
+  local now = os.time()
+  if auth_cache.age.timestamp + AUTH_CACHE_TTL > now then
+    return auth_cache.age.valid
+  end
+  
   -- Check if age keys are available (either via SOPS_AGE_KEY_FILE or SOPS_AGE_KEY env vars)
   local age_key_file = vim.env.SOPS_AGE_KEY_FILE
   if age_key_file and vim.fn.filereadable(age_key_file) == 1 then
+    auth_cache.age.valid = true
+    auth_cache.age.timestamp = now
     return true
   end
 
   local age_key = vim.env.SOPS_AGE_KEY
   if age_key and age_key ~= "" then
+    auth_cache.age.valid = true
+    auth_cache.age.timestamp = now
     return true
   end
 
@@ -398,10 +484,14 @@ local function check_age_keys()
   if home then
     local default_key_file = home .. "/.config/sops/age/keys.txt"
     if vim.fn.filereadable(default_key_file) == 1 then
+      auth_cache.age.valid = true
+      auth_cache.age.timestamp = now
       return true
     end
   end
 
+  auth_cache.age.valid = false
+  auth_cache.age.timestamp = now
   return false
 end
 
@@ -514,26 +604,7 @@ function M.decrypt_file(bufnr)
   -- Add Vault environment variables if needed (use stored metadata)
   local stored_metadata = sops_metadata[bufnr]
   if stored_metadata then
-    -- Extract vault address from stored metadata instead of current buffer
-    local addr = nil
-    local in_hc_vault_section = false
-
-    for _, line in ipairs(stored_metadata) do
-      if line:match("^%s*hc_vault:%s*$") then
-        in_hc_vault_section = true
-      elseif in_hc_vault_section and line:match("^%s") then
-        if line:match("^%s*%-") then
-          local found_addr = line:match("vault_address:%s*['\"]?(https://[%w%p]+)['\"]?")
-          if found_addr then
-            addr = found_addr
-            break
-          end
-        end
-      elseif in_hc_vault_section then
-        break -- Left the hc_vault section
-      end
-    end
-
+    local addr = extract_vault_address_from_metadata(stored_metadata)
     if addr then
       env["VAULT_ADDR"] = addr
       local token = get_vault_token(addr)
@@ -565,6 +636,15 @@ function M.cleanup_keys(bufnr)
   else
     vim.notify("[sops.nvim] No stored keys to clean up for this buffer", vim.log.levels.INFO)
   end
+end
+
+function M.clear_auth_cache()
+  -- Reset all cached authentication results
+  for backend, _ in pairs(auth_cache) do
+    auth_cache[backend].valid = false
+    auth_cache[backend].timestamp = 0
+  end
+  vim.notify("[sops.nvim] Cleared authentication cache", vim.log.levels.INFO)
 end
 
 function M.encrypt_file(bufnr)
@@ -608,25 +688,7 @@ function M.encrypt_file(bufnr)
   end
 
   -- Add Vault environment variables if needed (use stored metadata)
-  local addr = nil
-  local in_hc_vault_section = false
-
-  for _, line in ipairs(metadata) do
-    if line:match("^%s*hc_vault:%s*$") then
-      in_hc_vault_section = true
-    elseif in_hc_vault_section and line:match("^%s") then
-      if line:match("^%s*%-") then
-        local found_addr = line:match("vault_address:%s*['\"]?(https://[%w%p]+)['\"]?")
-        if found_addr then
-          addr = found_addr
-          break
-        end
-      end
-    elseif in_hc_vault_section then
-      break -- Left the hc_vault section
-    end
-  end
-
+  local addr = extract_vault_address_from_metadata(metadata)
   if addr then
     env["VAULT_ADDR"] = addr
     local token = get_vault_token(addr)
