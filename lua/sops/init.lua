@@ -3,6 +3,7 @@ local M = {}
 
 local config = {
   skip_failed_auth = false,
+  skip_explicit_keys = false,
 }
 
 -- Store SOPS metadata and extracted keys for each buffer
@@ -590,7 +591,7 @@ function M.encrypt_file(bufnr)
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
 
   -- Create temporary file with buffer content
-  local tmpfile = path .. ".tmp"
+  local tmpfile = string.gsub(path, "/([^/]*)$", "/tmp.%1")
   local fd = io.open(tmpfile, "w")
 
   if not fd then
@@ -638,6 +639,9 @@ function M.encrypt_file(bufnr)
 
   -- Build SOPS command with extracted keys using command line flags
   local sops_args = { "sops", "-e" }
+
+  if not config.skip_explicit_keys then
+
 
   -- Add KMS keys
   if #keys.kms > 0 then
@@ -695,6 +699,8 @@ function M.encrypt_file(bufnr)
       table.insert(sops_args, "--output-type=ini")
       -- For other formats, let SOPS auto-detect
     end
+  end
+
   end
 
   table.insert(sops_args, tmpfile)
